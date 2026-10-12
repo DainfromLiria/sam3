@@ -1,12 +1,19 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates. All Rights Reserved
 
+import inspect
 import types
 import unittest
-from unittest.mock import MagicMock
+from functools import wraps
+from unittest.mock import MagicMock, patch
 
 import torch
 from sam3.model.sam3_base_predictor import Sam3BasePredictor
+from sam3.model.sam3_video_inference import Sam3VideoInferenceWithInstanceInteractivity
 from sam3.model.sam3_video_predictor import Sam3VideoPredictor
+
+# The multiplex module checks GPU hardware at import. Test its real API on CPU.
+with patch("torch.cuda.get_device_properties", return_value=types.SimpleNamespace(major=7)):
+    from sam3.model.sam3_multiplex_tracking import Sam3MultiplexTrackingWithInteractivity
 
 
 class _StreamingModel:
@@ -23,6 +30,59 @@ class _StreamingModel:
                 7: torch.ones((1, 4, 4))
             }
             yield frame_idx, {"frame": frame_idx}
+
+
+class _SessionModel:
+    def __init__(self, init_state_method):
+        # Keep the real model signature without allocating its GPU weights.
+        @wraps(init_state_method)
+        def init_state(model, *args, **kwargs):
+            bound = inspect.signature(init_state_method).bind(model, *args, **kwargs)
+            model.received = bound.arguments
+            return {"num_frames": 1}
+
+        self.init_state = types.MethodType(init_state, self)
+
+
+class TestVideoPredictorSession(unittest.TestCase):
+    def _predictor(self, init_state_method):
+        predictor = Sam3BasePredictor()
+        predictor.model = _SessionModel(init_state_method)
+        predictor.async_loading_frames = True
+        predictor.video_loader_type = "cv2"
+        return predictor
+
+    def test_sam31_session_accepts_supported_options(self):
+        predictor = self._predictor(Sam3MultiplexTrackingWithInteractivity.init_state)
+        response = predictor.handle_request({
+            "type": "start_session", "resource_path": "/frames",
+            "offload_video_to_cpu": True,
+        })
+        received = predictor.model.received
+        self.assertEqual("/frames", received["resource_path"])
+        self.assertTrue(received["offload_video_to_cpu"])
+        self.assertTrue(received["async_loading_frames"])
+        self.assertNotIn("offload_state_to_cpu", received)
+        self.assertNotIn("video_loader_type", received)
+        self.assertIn(response["session_id"], predictor._all_inference_states)
+
+    def test_sam3_session_preserves_state_offload(self):
+        predictor = self._predictor(Sam3VideoInferenceWithInstanceInteractivity.init_state)
+        predictor.handle_request({
+            "type": "start_session", "resource_path": "/frames",
+            "offload_state_to_cpu": True,
+        })
+        self.assertTrue(predictor.model.received["offload_state_to_cpu"])
+        self.assertEqual("cv2", predictor.model.received["video_loader_type"])
+
+    def test_sam31_rejects_requested_state_offload(self):
+        predictor = self._predictor(Sam3MultiplexTrackingWithInteractivity.init_state)
+        with self.assertRaisesRegex(ValueError, "offload_state_to_cpu"):
+            predictor.handle_request({
+                "type": "start_session", "resource_path": "/frames",
+                "offload_state_to_cpu": True,
+            })
+        self.assertEqual({}, predictor._all_inference_states)
 
 
 class TestVideoPredictorStreaming(unittest.TestCase):

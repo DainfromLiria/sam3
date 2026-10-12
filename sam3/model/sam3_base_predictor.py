@@ -154,6 +154,18 @@ class Sam3BasePredictor:
             init_kwargs["async_loading_frames"] = self.async_loading_frames
         if hasattr(self, "video_loader_type"):
             init_kwargs["video_loader_type"] = self.video_loader_type
+
+        # SAM 3 and SAM 3.1 accept different session initialization options.
+        import inspect
+
+        params = inspect.signature(self.model.init_state).parameters
+        accepts_kwargs = any(
+            param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()
+        )
+        if not accepts_kwargs:
+            if offload_state_to_cpu and "offload_state_to_cpu" not in params:
+                raise ValueError("This model does not support offload_state_to_cpu.")
+            init_kwargs = {key: value for key, value in init_kwargs.items() if key in params}
         inference_state = self.model.init_state(**init_kwargs)
 
         if not session_id:
